@@ -1,14 +1,24 @@
-use std::env;
 use std::process::ExitCode;
 use std::time::Instant;
+use std::{env, io};
 
 use lk_47::board::{Position, STARTPOS};
 use lk_47::movegen::perft;
+use lk_47::uci;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.is_empty() {
+        return match uci::run(io::stdin().lock(), &mut io::stdout().lock()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let [command, depth, fen @ ..] = args.as_slice() else {
-        eprintln!("usage: lk-47 perft <depth> [fen]");
+        eprintln!("usage: lk-47 (UCI on stdin), or lk-47 perft <depth> [fen]");
         return ExitCode::FAILURE;
     };
     if command != "perft" {

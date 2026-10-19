@@ -3,3 +3,4 @@ pub mod board;
 pub mod movegen;
 #[cfg(test)]
 mod rays;
+pub mod uci;
