@@ -323,6 +323,34 @@ impl Position {
             | (rook_attacks(sq, occupied) & (self.pieces[ROOK] | self.pieces[QUEEN]))
     }
 
+    pub fn side(&self) -> usize {
+        self.side
+    }
+
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    pub fn in_check(&self) -> bool {
+        let king = (self.pieces[KING] & self.colors[self.side]).trailing_zeros() as usize;
+        let occupied = self.colors[WHITE] | self.colors[BLACK];
+        self.attackers_to(king, occupied) & self.colors[self.side ^ 1] != 0
+    }
+
+    // The side to move passes. Used only inside the search, where the halfmove clock restarts so no repetition is
+    // counted across the pass.
+    pub fn make_null(&self) -> Position {
+        let mut next = *self;
+        next.hash ^= KEYS.side;
+        if let Some(ep) = self.ep {
+            next.hash ^= KEYS.ep_file[ep as usize % 8];
+            next.ep = None;
+        }
+        next.side ^= 1;
+        next.halfmove = 0;
+        next
+    }
+
     pub fn make_move(&self, m: Move) -> Position {
         let mut next = *self;
         let us = self.side;
@@ -492,6 +520,18 @@ mod tests {
             let err = Position::from_fen(&fen).unwrap_err();
             assert!(err.contains(why), "{fen:?} gave {err:?}, expected {why:?}");
         }
+    }
+
+    #[test]
+    fn a_null_move_flips_the_side_and_keeps_the_hash_exact() {
+        let pos = Position::from_fen(FENS[5]).unwrap();
+        let null = pos.make_null();
+        assert_eq!((null.side, null.ep), (pos.side ^ 1, None));
+        assert_eq!(null.hash, null.compute_hash());
+        assert_eq!(
+            null.make_null().hash,
+            Position { ep: None, ..pos }.compute_hash()
+        );
     }
 
     #[test]

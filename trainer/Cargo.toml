@@ -1,0 +1,11 @@
+[package]
+name = "lk-47-trainer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "869e30934402d912609d3ee2baa9696a12e1f783" }
+
+[features]
+cuda = ["bullet_lib/cuda"]

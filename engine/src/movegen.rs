@@ -1,5 +1,5 @@
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 use crate::attacks::{
     BETWEEN, KING_ATTACKS, KNIGHT_ATTACKS, LINE, PAWN_ATTACKS, bishop_attacks, rook_attacks,
@@ -82,6 +82,12 @@ impl Deref for MoveList {
 
     fn deref(&self) -> &[Move] {
         &self.moves[..self.len]
+    }
+}
+
+impl DerefMut for MoveList {
+    fn deref_mut(&mut self) -> &mut [Move] {
+        &mut self.moves[..self.len]
     }
 }
 

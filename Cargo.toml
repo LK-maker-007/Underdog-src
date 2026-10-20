@@ -1,5 +1,7 @@
 [workspace]
-members = ["engine"]
+members = ["engine", "trainer"]
+# The trainer builds only with a GPU backend, so plain cargo commands cover the engine alone.
+default-members = ["engine"]
 resolver = "3"
 
 [profile.release]

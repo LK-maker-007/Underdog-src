@@ -61,8 +61,19 @@ fn main() {
         out.push_str("];\n");
     }
 
-    let path = Path::new(&env::var("OUT_DIR").unwrap()).join("tables.rs");
-    fs::write(path, out).unwrap();
+    let out_dir = env::var("OUT_DIR").unwrap();
+    fs::write(Path::new(&out_dir).join("tables.rs"), out).unwrap();
+
+    // The network built into the binary: the file named by LK47_NET, or none.
+    println!("cargo::rerun-if-env-changed=LK47_NET");
+    let net = match env::var("LK47_NET") {
+        Ok(path) => {
+            println!("cargo::rerun-if-changed={path}");
+            fs::read(&path).unwrap_or_else(|err| panic!("Cannot read LK47_NET {path:?}: {err}"))
+        }
+        Err(_) => Vec::new(),
+    };
+    fs::write(Path::new(&out_dir).join("net.bin"), net).unwrap();
 }
 
 // Squares whose occupancy changes the slider's attacks: the rays without their last square.
