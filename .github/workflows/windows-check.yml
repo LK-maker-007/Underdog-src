@@ -1,0 +1,46 @@
+name: windows-check
+
+on: workflow_dispatch
+
+jobs:
+  release-binaries:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Machine
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+          [System.Environment]::OSVersion.VersionString
+
+      - name: Download the public release and fastchess
+        run: |
+          base=https://github.com/LK-maker-007/Underdog/releases/download/v1.0
+          for f in lk-47-1.0-windows-x86-64-avx2.exe lk-47-1.0-windows-x86-64.exe SHA256SUMS; do
+            curl -sSL --fail -o "$f" "$base/$f"
+          done
+          grep windows SHA256SUMS | sha256sum -c -
+          curl -sSL --fail -o fastchess.zip \
+            https://github.com/Disservin/fastchess/releases/download/v1.8.2-alpha/fastchess-windows-x86-64.zip
+          echo "007ce550dc809510b34622a1aeb43fd443d40284045bef5c1bc39c8941114143  fastchess.zip" | sha256sum -c -
+
+      - name: Unpack fastchess
+        shell: pwsh
+        run: Expand-Archive fastchess.zip -DestinationPath .
+
+      # Each binary must give the Linux build's bench node count, name itself, play a legal move with Hash 256 and
+      # Threads 2, and pass fastchess's compliance check.
+      - name: Bench, UCI and compliance
+        run: |
+          for exe in lk-47-1.0-windows-x86-64-avx2.exe lk-47-1.0-windows-x86-64.exe; do
+            echo "== $exe"
+            ./$exe bench | tee bench.txt
+            grep -q "^nodes 48983" bench.txt
+            { printf 'uci\nsetoption name Hash value 256\nsetoption name Threads value 2\nisready\n'
+              printf 'position startpos moves e2e4 e7e5\ngo depth 14\n'; sleep 20; printf 'quit\n'; } | ./$exe | tee uci.txt
+            grep -q "^id name LK-47 1.0" uci.txt
+            grep -q "^bestmove [a-h][1-8][a-h][1-8]" uci.txt
+            ./fastchess-windows-x86-64/fastchess.exe --compliance ./$exe
+          done
