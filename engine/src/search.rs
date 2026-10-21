@@ -25,11 +25,13 @@ const KILLER_KEY: i32 = 800_000;
 // First guesses, to be tuned by SPRT.
 const ASPIRATION_WINDOW: i32 = 25;
 const NULL_REDUCTION: i32 = 3;
+const NULL_MARGIN: i32 = 200;
 const RFP_DEPTH: i32 = 6;
 const RFP_MARGIN: i32 = 80;
 const LMR_FULL_MOVES: usize = 3;
 const LMR_BASE: f64 = 0.75;
 const LMR_DIVISOR: f64 = 2.25;
+const LMR_HISTORY: i32 = 8_192;
 const LMP_DEPTH: i32 = 8;
 const FUTILITY_DEPTH: i32 = 6;
 const FUTILITY_BASE: i32 = 100;
@@ -38,6 +40,13 @@ const HISTORY_MAX: i32 = 16_384;
 const IIR_DEPTH: i32 = 4;
 const SINGULAR_DEPTH: i32 = 8;
 const SINGULAR_MARGIN: i32 = 2;
+// Correction entries are in 1/256 of a centipawn; one update moves an entry at most 16/256 of the way.
+const CORRECTION_SIZE: usize = 16_384;
+const CORRECTION_GRAIN: i32 = 256;
+const CORRECTION_LIMIT: i32 = 128 * CORRECTION_GRAIN;
+
+// The share of the planned time to spend, by how many iterations in a row kept the same best move.
+const STABILITY_SCALE: [f64; 4] = [1.4, 1.1, 1.0, 0.75];
 
 // Piece values for exchanges only; the king's is large so that taking a defended piece with it never pays.
 const SEE_VALUES: [i32; 6] = [100, 300, 300, 500, 900, 20_000];
@@ -80,6 +89,14 @@ pub struct Searcher {
     history: [[[i32; 64]; 64]; 2],
     // The move a singular extension search leaves out at each ply, or the null move.
     excluded: [Move; MAX_PLY],
+    // Quiet move scores by the move before them: [its piece][its square][this piece][this square].
+    continuation: Vec<[[[i32; 64]; 12]; 64]>,
+    // The piece and square of the move made at each ply, None for a null move.
+    moved: [Option<(usize, usize)>; MAX_PLY + 1],
+    // The static score at each ply of the current path, -INFINITY where the side to move was in check.
+    evals: [i32; MAX_PLY],
+    // How far search results sat from the static score, by side to move and pawn structure.
+    correction: Vec<[i32; CORRECTION_SIZE]>,
     // Late move reductions by depth and move number.
     reductions: Box<[[i32; 64]; 64]>,
 }
@@ -117,6 +134,10 @@ impl Searcher {
             killers: [[Move::default(); 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             excluded: [Move::default(); MAX_PLY],
+            continuation: vec![[[[0; 64]; 12]; 64]; 12],
+            moved: [None; MAX_PLY + 1],
+            evals: [0; MAX_PLY],
+            correction: vec![[0; CORRECTION_SIZE]; 2],
             reductions: Box::new(std::array::from_fn(|depth| {
                 std::array::from_fn(|moves| {
                     let (d, m) = (depth.max(1) as f64, moves.max(1) as f64);
@@ -185,12 +206,16 @@ impl Searcher {
         for score in self.history.iter_mut().flatten().flatten() {
             *score /= 2;
         }
+        for score in self.continuation.iter_mut().flatten().flatten().flatten() {
+            *score /= 2;
+        }
 
         if pos.legal_moves().is_empty() {
             return None;
         }
-        let mut best = None;
+        let mut best: Option<(Move, i32)> = None;
         let mut score = 0;
+        let mut stable = 0;
         for depth in 1..=self.limits.depth {
             // From depth 4 on, search a narrow window around the last score and widen it on a miss.
             let mut delta = ASPIRATION_WINDOW;
@@ -223,6 +248,11 @@ impl Searcher {
                 self.pv_len[0] = 1;
                 score = 0;
             }
+            stable = if best.is_some_and(|(m, _)| m == self.pv[0][0]) {
+                stable + 1
+            } else {
+                0
+            };
             best = Some((self.pv[0][0], score));
 
             let elapsed = self.start.elapsed();
@@ -238,7 +268,20 @@ impl Searcher {
                 self.nodes * 1000 / ms.max(1),
                 pv.join(" ")
             ));
-            if self.stopped || self.limits.soft.is_some_and(|soft| elapsed >= soft) {
+            // On a clock, a best move that just changed earns more time and one that has held for three
+            // iterations less; a fixed move time is spent as given.
+            let scale = match self.limits.hard {
+                Some(hard) if self.limits.soft.is_some_and(|soft| soft < hard) => {
+                    STABILITY_SCALE[stable.min(STABILITY_SCALE.len() - 1)]
+                }
+                _ => 1.0,
+            };
+            if self.stopped
+                || self
+                    .limits
+                    .soft
+                    .is_some_and(|soft| elapsed >= soft.mul_f64(scale))
+            {
                 break;
             }
         }
@@ -298,13 +341,23 @@ impl Searcher {
             }
         }
 
-        let static_eval = if in_check {
+        let raw_eval = if in_check {
             -INFINITY
         } else {
             self.static_eval(pos, ply)
         };
+        let static_eval = if in_check {
+            -INFINITY
+        } else {
+            self.corrected(pos, raw_eval)
+        };
+        self.evals[ply] = static_eval;
+        // Better than two plies ago, when this side last moved: prune less, reduce less.
+        let improving = !in_check && ply >= 2 && static_eval > self.evals[ply - 2];
         if !pv_node && !in_check && !singular_search && beta.abs() < MATE_BOUND {
-            if depth <= RFP_DEPTH && static_eval - RFP_MARGIN * depth >= beta {
+            if depth <= RFP_DEPTH
+                && static_eval - RFP_MARGIN * (depth - i32::from(improving)) >= beta
+            {
                 return static_eval;
             }
             // Passing is never legal, so a side with only pawns can be in zugzwang; skip the null move there.
@@ -315,9 +368,12 @@ impl Searcher {
                 if self.net.is_some() {
                     self.accumulators[ply + 1] = self.accumulators[ply];
                 }
+                self.moved[ply] = None;
+                let reduction =
+                    NULL_REDUCTION + depth / 3 + ((static_eval - beta) / NULL_MARGIN).min(3);
                 let score = -self.negamax(
                     null,
-                    depth - 1 - NULL_REDUCTION,
+                    depth - 1 - reduction,
                     -beta,
                     -beta + 1,
                     ply + 1,
@@ -339,6 +395,7 @@ impl Searcher {
         }
 
         let mut keys = order_keys(pos, &moves, entry.map(|e| e.best));
+        let previous = ply.checked_sub(1).and_then(|p| self.moved[p]);
         for (key, &m) in keys.iter_mut().zip(moves.iter()) {
             if *key == 0 {
                 *key = if m == self.killers[ply][0] {
@@ -346,7 +403,7 @@ impl Searcher {
                 } else if m == self.killers[ply][1] {
                     KILLER_KEY - 1
                 } else {
-                    self.history[pos.side][m.from()][m.to()].min(KILLER_KEY - 2)
+                    self.quiet_history(pos, previous, m).min(KILLER_KEY - 2)
                 };
             }
         }
@@ -397,7 +454,9 @@ impl Searcher {
             // Quiet moves far below alpha, or late in a long list at low depth, are skipped once one move has
             // shown the node is not lost.
             if !pv_node && !in_check && quiet && best > -MATE_BOUND && !child.in_check() {
-                if depth <= LMP_DEPTH && quiet_count >= 3 + (depth * depth) as usize {
+                if depth <= LMP_DEPTH
+                    && quiet_count >= (3 + depth * depth) as usize / (2 - usize::from(improving))
+                {
                     continue;
                 }
                 if depth <= FUTILITY_DEPTH
@@ -407,6 +466,7 @@ impl Searcher {
                 }
             }
             self.push_accumulator(ply, pos, &child, m);
+            self.moved[ply] = Some((pos.board[m.from()] as usize, m.to()));
             let score = if i == 0 {
                 -self.negamax(&child, new_depth, -beta, -alpha, ply + 1, true)
             } else {
@@ -418,8 +478,10 @@ impl Searcher {
                         let killer = self.killers[ply].contains(&m);
                         (self.reductions[depth.min(63) as usize][i.min(63)]
                             - i32::from(pv_node)
-                            - i32::from(killer))
-                        .clamp(0, depth - 2)
+                            - i32::from(killer)
+                            + i32::from(!improving)
+                            - self.quiet_history(pos, previous, m) / LMR_HISTORY)
+                            .clamp(0, depth - 2)
                     } else {
                         0
                     };
@@ -450,7 +512,7 @@ impl Searcher {
                     self.update_pv(ply, m);
                     if score >= beta {
                         if quiet {
-                            self.record_cutoff(ply, pos.side, m, depth, &quiets[..quiet_count]);
+                            self.record_cutoff(pos, ply, m, depth, &quiets[..quiet_count]);
                         }
                         break;
                     }
@@ -472,6 +534,17 @@ impl Searcher {
             };
             self.tt
                 .store(pos.hash, best_move, to_tt(best, ply), depth, bound);
+            // Learn only from results that say which side of the static score the truth lies on. A capture
+            // as best move means material changed, which the pawn-keyed table cannot describe.
+            let quiet_best = !best_move.is_capture() && best_move.promotion().is_none();
+            if !in_check
+                && quiet_best
+                && best.abs() < MATE_BOUND
+                && !(bound == LOWER && best <= static_eval)
+                && !(bound == UPPER && best >= static_eval)
+            {
+                self.update_correction(pos, depth, best - raw_eval);
+            }
         }
         best
     }
@@ -489,17 +562,33 @@ impl Searcher {
         if ply >= MAX_PLY - 1 {
             return self.static_eval(pos, ply);
         }
+        // Every stored entry comes from a search at least this deep, so any usable bound ends the node.
+        let entry = self.tt.probe(pos.hash);
+        if let Some(e) = entry {
+            let score = from_tt(e.score as i32, ply);
+            if e.bound == EXACT
+                || (e.bound == LOWER && score >= beta)
+                || (e.bound == UPPER && score <= alpha)
+            {
+                return score;
+            }
+        }
 
         let in_check = pos.in_check();
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
             return if in_check { -MATE + ply as i32 } else { 0 };
         }
-        let mut keys = order_keys(pos, &moves, None);
+        // A quiet table move goes first only in check; otherwise it would end the captures-only loop below.
+        let tt_move = entry
+            .map(|e| e.best)
+            .filter(|m| in_check || m.is_capture() || m.promotion() == Some(QUEEN));
+        let mut keys = order_keys(pos, &moves, tt_move);
         let mut best = if in_check {
             -INFINITY
         } else {
-            self.static_eval(pos, ply)
+            let raw = self.static_eval(pos, ply);
+            self.corrected(pos, raw)
         };
         if best >= beta {
             return best;
@@ -536,17 +625,28 @@ impl Searcher {
 
     // The cutoff move's history rises and that of the quiet moves tried before it falls, each change shrinking as
     // the score nears HISTORY_MAX so no entry runs away.
-    fn record_cutoff(&mut self, ply: usize, side: usize, m: Move, depth: i32, failed: &[Move]) {
+    fn record_cutoff(&mut self, pos: &Position, ply: usize, m: Move, depth: i32, failed: &[Move]) {
         if self.killers[ply][0] != m {
             self.killers[ply][1] = self.killers[ply][0];
             self.killers[ply][0] = m;
         }
         let bonus = (depth * depth).min(HISTORY_MAX / 4);
+        let previous = ply.checked_sub(1).and_then(|p| self.moved[p]);
         let moves = std::iter::once((m, bonus)).chain(failed.iter().map(|&f| (f, -bonus)));
         for (mv, change) in moves {
-            let score = &mut self.history[side][mv.from()][mv.to()];
-            *score += change - *score * change.abs() / HISTORY_MAX;
+            let gravity = |score: &mut i32| *score += change - *score * change.abs() / HISTORY_MAX;
+            gravity(&mut self.history[pos.side][mv.from()][mv.to()]);
+            if let Some((before, to)) = previous {
+                gravity(&mut self.continuation[before][to][pos.board[mv.from()] as usize][mv.to()]);
+            }
         }
+    }
+
+    fn quiet_history(&self, pos: &Position, previous: Option<(usize, usize)>, m: Move) -> i32 {
+        let follow = previous.map_or(0, |(piece, to)| {
+            self.continuation[piece][to][pos.board[m.from()] as usize][m.to()]
+        });
+        self.history[pos.side][m.from()][m.to()] + follow
     }
 
     fn push_accumulator(&mut self, ply: usize, pos: &Position, child: &Position, m: Move) {
@@ -561,6 +661,18 @@ impl Searcher {
             Some(net) => net.evaluate(&self.accumulators[ply], pos),
             None => evaluate(pos),
         }
+    }
+
+    fn corrected(&self, pos: &Position, raw: i32) -> i32 {
+        let entry = self.correction[pos.side][pawn_index(pos)];
+        (raw + entry / CORRECTION_GRAIN).clamp(-MATE_BOUND + 1, MATE_BOUND - 1)
+    }
+
+    // Moves the entry toward the latest gap, faster for deeper results.
+    fn update_correction(&mut self, pos: &Position, depth: i32, gap: i32) {
+        let entry = &mut self.correction[pos.side][pawn_index(pos)];
+        let target = (gap * CORRECTION_GRAIN).clamp(-CORRECTION_LIMIT, CORRECTION_LIMIT);
+        *entry += (target - *entry) * (depth + 1).min(16) / 256;
     }
 
     fn update_pv(&mut self, ply: usize, m: Move) {
@@ -664,6 +776,15 @@ fn see(pos: &Position, m: Move) -> i32 {
         gain[d - 1] = -(-gain[d - 1]).max(gain[d]);
     }
     gain[0]
+}
+
+fn pawn_index(pos: &Position) -> usize {
+    let white = pos.pieces[PAWN] & pos.colors[WHITE];
+    let black = pos.pieces[PAWN] & pos.colors[BLACK];
+    let mixed = (white.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ black.wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+    .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (mixed >> (64 - CORRECTION_SIZE.trailing_zeros())) as usize
 }
 
 // The table holds mate scores as distance from the stored node, the search as distance from the root.
@@ -817,23 +938,38 @@ mod tests {
 
     #[test]
     fn killers_keep_the_two_latest_cutoff_moves() {
+        let pos = Position::from_fen(crate::board::STARTPOS).unwrap();
         let mut searcher = Searcher::default();
         let (a, b) = (
             Move::new(12, 28, Move::DOUBLE_PUSH),
             Move::new(6, 21, Move::QUIET),
         );
-        searcher.record_cutoff(3, 0, a, 4, &[]);
-        searcher.record_cutoff(3, 0, a, 4, &[]);
+        searcher.record_cutoff(&pos, 3, a, 4, &[]);
+        searcher.record_cutoff(&pos, 3, a, 4, &[]);
         assert_eq!(
             searcher.killers[3],
             [a, Move::default()],
             "a repeat does not push the old killer out"
         );
-        searcher.record_cutoff(3, 0, b, 2, &[a]);
+        searcher.record_cutoff(&pos, 3, b, 2, &[a]);
         assert_eq!(searcher.killers[3], [b, a]);
         // 16 then 16 + 16 - 16 * 16 / 16384 = 32, then the failed move loses 4 - 32 * 4 / 16384 = 4.
         assert_eq!(searcher.history[0][12][28], 28);
         assert_eq!(searcher.history[0][6][21], 4);
+        assert!(
+            searcher
+                .continuation
+                .iter()
+                .flatten()
+                .flatten()
+                .flatten()
+                .all(|&s| s == 0),
+            "no move came before ply 3"
+        );
+        // After a black knight's b8c6, the cutoff by e2e4 is scored under that move.
+        searcher.moved[4] = Some((7, 42));
+        searcher.record_cutoff(&pos, 5, a, 3, &[]);
+        assert_eq!(searcher.continuation[7][42][0][28], 9);
         assert_eq!(
             searcher.killers[2],
             [Move::default(); 2],
@@ -1008,6 +1144,49 @@ mod tests {
         let without = searcher.negamax(&pos, 3, -INFINITY, INFINITY, 1, false);
         assert_ne!(searcher.pv[1][0], take);
         assert!(without < with - 500, "with {with}, without {without}");
+    }
+
+    #[test]
+    fn quiescence_takes_a_bound_from_the_table() {
+        // Static count says White is a rook up; a stored upper bound of -50 from a deeper search overrules it.
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mut searcher = Searcher::default();
+        let open = searcher.quiescence(&pos, -INFINITY, INFINITY, 1);
+        assert!(open > 300, "{open}");
+        searcher
+            .tt
+            .store(pos.hash, Move::default(), to_tt(-50, 1), 5, UPPER);
+        assert_eq!(searcher.quiescence(&pos, -40, 0, 1), -50);
+        assert_eq!(
+            searcher.quiescence(&pos, -100, 0, 1),
+            open,
+            "an upper bound above alpha decides nothing"
+        );
+    }
+
+    #[test]
+    fn corrections_follow_search_results_for_the_same_pawns() {
+        let pos = Position::from_fen(crate::board::STARTPOS).unwrap();
+        let other =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+                .unwrap();
+        assert_ne!(pawn_index(&pos), pawn_index(&other));
+        let mut searcher = Searcher::default();
+        for _ in 0..200 {
+            searcher.update_correction(&pos, 20, 100);
+        }
+        let shift = searcher.corrected(&pos, 0);
+        assert!((95..=100).contains(&shift), "{shift}");
+        assert_eq!(
+            searcher.corrected(&other, 0),
+            0,
+            "other pawns are untouched"
+        );
+        for _ in 0..500 {
+            searcher.update_correction(&pos, 20, 1_000);
+        }
+        let capped = searcher.corrected(&pos, 0);
+        assert!((120..=128).contains(&capped), "{capped}");
     }
 
     #[test]

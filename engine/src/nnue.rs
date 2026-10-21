@@ -1,26 +1,45 @@
 use crate::board::{BLACK, EMPTY, KING, PAWN, Position, ROOK, WHITE, squares};
 use crate::movegen::Move;
 
-// The network file's contract with `trainer/src/main.rs`: (768 -> HIDDEN)x2 -> 1 with SCReLU, the first layer
-// quantised by QA, the output weights by QB, and the output scaled by SCALE into centipawns.
-pub const HIDDEN: usize = 512;
+// The network file's contract with the `buckets` mode of `trainer/src/main.rs`: (768 x INPUT_BUCKETS -> HIDDEN)x2
+// -> OUTPUT_BUCKETS with SCReLU, the first layer quantised by QA, the output weights by QB, and the output scaled by
+// SCALE into centipawns.
+pub const HIDDEN: usize = 1024;
 const SCALE: i32 = 400;
 const QA: i32 = 255;
 const QB: i32 = 64;
 
-const FEATURES: usize = 768;
+// The trainer's KING_BUCKETS: a side's input weights by its own king's square, seen from that side and mirrored onto
+// files a to d, one entry per rank and mirrored file.
+#[rustfmt::skip]
+const KING_BUCKETS: [usize; 32] = [
+    0, 0, 1, 1,
+    2, 2, 2, 2,
+    3, 3, 3, 3,
+    3, 3, 3, 3,
+    3, 3, 3, 3,
+    3, 3, 3, 3,
+    3, 3, 3, 3,
+    3, 3, 3, 3,
+];
+const INPUT_BUCKETS: usize = 4;
+// Output weights by pieces on the board: (pieces - 2) / 4.
+const OUTPUT_BUCKETS: usize = 8;
+
+const FEATURES: usize = 768 * INPUT_BUCKETS;
 // Keeps a clamped value times an output weight within i16: 255 * 128 = 32,640.
 const MAX_OUTPUT_WEIGHT: u16 = 128;
-// i16 values in file order: first-layer weights by feature, first-layer biases, output weights, output bias.
-const VALUES: usize = FEATURES * HIDDEN + HIDDEN + 2 * HIDDEN + 1;
+// i16 values in file order: first-layer weights by feature, first-layer biases, each output bucket's weights in turn,
+// then the output biases.
+const VALUES: usize = FEATURES * HIDDEN + HIDDEN + OUTPUT_BUCKETS * 2 * HIDDEN + OUTPUT_BUCKETS;
 
 static BUILT_IN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net.bin"));
 
 pub struct Network {
     weights: Vec<[i16; HIDDEN]>,
     bias: [i16; HIDDEN],
-    output: [i16; 2 * HIDDEN],
-    output_bias: i16,
+    output: Vec<[i16; 2 * HIDDEN]>,
+    output_bias: [i16; OUTPUT_BUCKETS],
 }
 
 impl Network {
@@ -44,9 +63,15 @@ impl Network {
             .map(|_| std::array::from_fn(|_| take()))
             .collect();
         let bias = std::array::from_fn(|_| take());
-        let output: [i16; 2 * HIDDEN] = std::array::from_fn(|_| take());
-        let output_bias = take();
-        if let Some(weight) = output.iter().find(|w| w.unsigned_abs() > MAX_OUTPUT_WEIGHT) {
+        let output: Vec<[i16; 2 * HIDDEN]> = (0..OUTPUT_BUCKETS)
+            .map(|_| std::array::from_fn(|_| take()))
+            .collect();
+        let output_bias = std::array::from_fn(|_| take());
+        if let Some(weight) = output
+            .iter()
+            .flatten()
+            .find(|w| w.unsigned_abs() > MAX_OUTPUT_WEIGHT)
+        {
             return Err(format!(
                 "An output weight of {weight} is beyond the supported {MAX_OUTPUT_WEIGHT}"
             ));
@@ -70,7 +95,9 @@ impl Network {
 
     // Centipawns from the side to move's point of view; `acc` is the accumulator of `pos`.
     pub fn evaluate(&self, acc: &Accumulator, pos: &Position) -> i32 {
-        let side = pos.side;
+        let pieces = (pos.colors[WHITE] | pos.colors[BLACK]).count_ones() as usize;
+        let bucket = (pieces - 2) / 32usize.div_ceil(OUTPUT_BUCKETS);
+        let (side, output) = (pos.side, &self.output[bucket]);
         let half = |values: &[i16; HIDDEN], weights: &[i16]| -> i32 {
             values
                 .iter()
@@ -81,18 +108,37 @@ impl Network {
                 })
                 .sum()
         };
-        let sum = half(&acc.values[side], &self.output[..HIDDEN])
-            + half(&acc.values[side ^ 1], &self.output[HIDDEN..]);
-        (sum / QA + i32::from(self.output_bias)) * SCALE / (QA * QB)
+        let sum = half(&acc.values[side], &output[..HIDDEN])
+            + half(&acc.values[side ^ 1], &output[HIDDEN..]);
+        (sum / QA + i32::from(self.output_bias[bucket])) * SCALE / (QA * QB)
     }
 }
 
-// Each side's view of the board: its own pieces count first, and Black sees the board turned over.
-fn feature(perspective: usize, piece: u8, sq: usize) -> usize {
+// The input bucket a side uses and whether it mirrors the board (7) or not (0), from its own king's square.
+fn king_key(perspective: usize, king: usize) -> (usize, usize) {
+    let king = if perspective == WHITE {
+        king
+    } else {
+        king ^ 56
+    };
+    let file = king % 8;
+    (
+        KING_BUCKETS[(king / 8) * 4 + file.min(7 - file)],
+        if file > 3 { 7 } else { 0 },
+    )
+}
+
+fn king_square(pos: &Position, side: usize) -> usize {
+    (pos.pieces[KING] & pos.colors[side]).trailing_zeros() as usize
+}
+
+// Each side's view of the board: its own pieces count first, Black sees the board turned over, and the board is
+// mirrored when that side's king stands on files e to h.
+fn feature(perspective: usize, (bucket, mirror): (usize, usize), piece: u8, sq: usize) -> usize {
     let (color, kind) = (piece as usize / 6, piece as usize % 6);
     let theirs = if color == perspective { 0 } else { 384 };
     let sq = if perspective == WHITE { sq } else { sq ^ 56 };
-    theirs + 64 * kind + sq
+    768 * bucket + theirs + 64 * kind + (sq ^ mirror)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -105,33 +151,32 @@ impl Accumulator {
         let mut acc = Accumulator {
             values: [net.bias; 2],
         };
-        for sq in squares(pos.colors[WHITE] | pos.colors[BLACK]) {
-            acc.change(net, pos.board[sq], sq, true);
+        for perspective in [WHITE, BLACK] {
+            acc.refresh(net, pos, perspective);
         }
         acc
     }
 
-    fn change(&mut self, net: &Network, piece: u8, sq: usize, add: bool) {
-        for perspective in [WHITE, BLACK] {
-            let weights = &net.weights[feature(perspective, piece, sq)];
-            for (value, &weight) in self.values[perspective].iter_mut().zip(weights) {
-                *value = if add {
-                    value.wrapping_add(weight)
-                } else {
-                    value.wrapping_sub(weight)
-                };
+    fn refresh(&mut self, net: &Network, pos: &Position, perspective: usize) {
+        let key = king_key(perspective, king_square(pos, perspective));
+        let values = &mut self.values[perspective];
+        *values = net.bias;
+        for sq in squares(pos.colors[WHITE] | pos.colors[BLACK]) {
+            let weights = &net.weights[feature(perspective, key, pos.board[sq], sq)];
+            for (value, &weight) in values.iter_mut().zip(weights) {
+                *value = value.wrapping_add(weight);
             }
         }
     }
 
-    // Sets this to the accumulator of `_child`, the position after `m`, from `prev`, the accumulator of `pos`, in one
-    // pass per perspective. The child is unused here; a network with king buckets needs it to rebuild a side.
+    // Sets this to the accumulator of `child`, the position after `m`, from `prev`, the accumulator of `pos`: one
+    // pass per side, or a rebuild of a side whose king moved into another bucket or across the board's middle.
     pub fn update(
         &mut self,
         prev: &Accumulator,
         net: &Network,
         pos: &Position,
-        _child: &Position,
+        child: &Position,
         m: Move,
     ) {
         let (from, to) = (m.from(), m.to());
@@ -152,7 +197,12 @@ impl Accumulator {
         debug_assert!(moved != EMPTY && (moved as usize % 6 == PAWN || m.promotion().is_none()));
         debug_assert!(castle.is_none() || moved as usize % 6 == KING);
         for perspective in [WHITE, BLACK] {
-            let row = |piece: u8, sq: usize| &net.weights[feature(perspective, piece, sq)];
+            let key = king_key(perspective, king_square(child, perspective));
+            if key != king_key(perspective, king_square(pos, perspective)) {
+                self.refresh(net, child, perspective);
+                continue;
+            }
+            let row = |piece: u8, sq: usize| &net.weights[feature(perspective, key, piece, sq)];
             let (out, input) = (&mut self.values[perspective], &prev.values[perspective]);
             let (add, sub) = (row(placed, to), row(moved, from));
             match (taken, castle) {
@@ -251,6 +301,33 @@ pub(crate) mod tests {
         );
     }
 
+    // Without castling rights, the board seen in a mirror is the same position to the network.
+    #[test]
+    fn a_position_mirrored_left_to_right_scores_the_same() {
+        let net = random_network();
+        for fen in [
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            "2kr4/ppp2ppp/8/8/8/8/PPP2PPP/2KR4 b - - 0 20",
+        ] {
+            let (board, rest) = fen.split_once(' ').unwrap();
+            let mirrored: Vec<String> = board
+                .split('/')
+                .map(|rank| rank.chars().rev().collect())
+                .collect();
+            let mirrored = format!("{} {rest}", mirrored.join("/"));
+            let (a, b) = (
+                Position::from_fen(fen).unwrap(),
+                Position::from_fen(&mirrored).unwrap(),
+            );
+            assert_eq!(
+                net.evaluate(&Accumulator::new(&net, &a), &a),
+                net.evaluate(&Accumulator::new(&net, &b), &b),
+                "{fen} against {mirrored}"
+            );
+        }
+    }
+
     #[test]
     fn evaluation_matches_the_plain_formula() {
         let net = random_network();
@@ -264,14 +341,15 @@ pub(crate) mod tests {
             let pos = Position::from_fen(fen).unwrap();
             let acc = Accumulator::new(&net, &pos);
             let side = pos.side;
+            let bucket = ((pos.colors[WHITE] | pos.colors[BLACK]).count_ones() as usize - 2) / 4;
             let mut sum = 0;
             for i in 0..HIDDEN {
                 let ours = i32::from(acc.values[side][i]).clamp(0, QA);
                 let theirs = i32::from(acc.values[side ^ 1][i]).clamp(0, QA);
-                sum += ours * ours * i32::from(net.output[i])
-                    + theirs * theirs * i32::from(net.output[HIDDEN + i]);
+                sum += ours * ours * i32::from(net.output[bucket][i])
+                    + theirs * theirs * i32::from(net.output[bucket][HIDDEN + i]);
             }
-            let plain = (sum / QA + i32::from(net.output_bias)) * SCALE / (QA * QB);
+            let plain = (sum / QA + i32::from(net.output_bias[bucket])) * SCALE / (QA * QB);
             assert_eq!(net.evaluate(&acc, &pos), plain, "{fen}");
         }
     }

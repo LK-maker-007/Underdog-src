@@ -37,7 +37,7 @@ jobs:
           for exe in lk-47-1.0-windows-x86-64-avx2.exe lk-47-1.0-windows-x86-64.exe; do
             echo "== $exe"
             ./$exe bench | tee bench.txt
-            grep -q "^nodes 48983" bench.txt
+            grep -q "^nodes 35468" bench.txt
             { printf 'uci\nsetoption name Hash value 256\nsetoption name Threads value 2\nisready\n'
               printf 'position startpos moves e2e4 e7e5\ngo depth 14\n'; sleep 20; printf 'quit\n'; } | ./$exe | tee uci.txt
             grep -q "^id name LK-47 1.0" uci.txt
