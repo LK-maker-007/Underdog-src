@@ -60,7 +60,7 @@ pub fn run(input: impl BufRead, out: Output) -> io::Result<()> {
             "uci" => say(
                 &out,
                 &format!(
-                    "id name LK-47 1.0\nid author Singaraj B\n\
+                    "id name LK-47 1.1\nid author Singaraj B\n\
                      option name EvalFile type string default <empty>\n\
                      option name Hash type spin default {HASH_MB} min 1 max {MAX_HASH_MB}\n\
                      option name Threads type spin default 1 min 1 max {MAX_THREADS}\nuciok"
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(
             talk("uci\nisready\n"),
             [
-                "id name LK-47 1.0",
+                "id name LK-47 1.1",
                 "id author Singaraj B",
                 "option name EvalFile type string default <empty>",
                 "option name Hash type spin default 16 min 1 max 65536",

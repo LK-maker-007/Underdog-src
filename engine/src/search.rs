@@ -47,6 +47,9 @@ const CORRECTION_LIMIT: i32 = 128 * CORRECTION_GRAIN;
 
 // The share of the planned time to spend, by how many iterations in a row kept the same best move.
 const STABILITY_SCALE: [f64; 4] = [1.4, 1.1, 1.0, 0.75];
+// An iteration takes about twice as long as the one before it, so one started after this share of the planned time
+// would run well past it.
+const NEXT_ITERATION_SHARE: f64 = 0.5;
 
 // Piece values for exchanges only; the king's is large so that taking a defended piece with it never pays.
 const SEE_VALUES: [i32; 6] = [100, 300, 300, 500, 900, 20_000];
@@ -272,7 +275,7 @@ impl Searcher {
             // iterations less; a fixed move time is spent as given.
             let scale = match self.limits.hard {
                 Some(hard) if self.limits.soft.is_some_and(|soft| soft < hard) => {
-                    STABILITY_SCALE[stable.min(STABILITY_SCALE.len() - 1)]
+                    STABILITY_SCALE[stable.min(STABILITY_SCALE.len() - 1)] * NEXT_ITERATION_SHARE
                 }
                 _ => 1.0,
             };

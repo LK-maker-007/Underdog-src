@@ -1,6 +1,6 @@
-LK-47 1.0
+LK-47 1.1
 
-The neural network built into LK-47 1.0 was trained on data obtained from the
+The neural network built into LK-47 1.1 was trained on data obtained from the
 database "master-binpacks" (https://huggingface.co/datasets/official-stockfish/master-binpacks),
 files test80-2022-08-aug-16tb7p.v6-dd.min.binpack, farseerT76.binpack and
 farseerT74.binpack. Its README describes it as "A stockfish binpack collection
